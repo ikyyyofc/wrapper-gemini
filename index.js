@@ -66,8 +66,7 @@ app.post("/v1beta/models/:modelAndAction", async (req, res) => {
             request: {
                 contents: contents ?? [],
                 generationConfig: generationConfig ?? {
-                    thinkingConfig: { thinkingLevel: "HIGH" },
-                    temperature: 0
+                    thinkingConfig: { thinkingLevel: "HIGH" }
                 },
                 safetySettings: safetySettings ?? [
                     { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_NONE" },
