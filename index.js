@@ -4,24 +4,20 @@ import axios from "axios";
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-const CONFIG = {
-    GEMMY_URL: "https://us-central1-gemmy-ai-bdc03.cloudfunctions.net/gemini",
-    DEFAULT_MODEL: "gemini-pro-latest",
-    HEADERS: {
-        "User-Agent": "okhttp/5.3.2",
-        "Accept-Encoding": "gzip",
-        "content-type": "application/json; charset=UTF-8"
-    }
+const GEMMY_URL = "https://us-central1-gemmy-ai-bdc03.cloudfunctions.net/gemini";
+const GEMMY_HEADERS = {
+    "User-Agent": "okhttp/5.3.2",
+    "Accept-Encoding": "identity", // matikan gzip biar stream bisa dibaca langsung
+    "content-type": "application/json; charset=UTF-8"
 };
 
-// Cache token biar ga minta terus tiap request
 let cachedToken = null;
 let tokenExpiry = 0;
 
 async function getToken() {
     if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
 
-    const response = await axios.post(
+    const { data } = await axios.post(
         "https://www.googleapis.com/identitytoolkit/v3/relyingparty/signupNewUser?key=AIzaSyAxof8_SbpDcww38NEQRhNh0Pzvbphh-IQ",
         { clientType: "CLIENT_TYPE_ANDROID" },
         {
@@ -35,85 +31,135 @@ async function getToken() {
         }
     );
 
-    cachedToken = response.data.idToken;
-    // Firebase anonymous token biasanya expired 1 jam, cache 55 menit
+    cachedToken = data.idToken;
     tokenExpiry = Date.now() + 55 * 60 * 1000;
     return cachedToken;
 }
 
-// Handle: POST /v1beta/models/:modelAndAction
-// Contoh:  POST /v1beta/models/gemini-2.5-pro:generateContent
-//          POST /v1beta/models/gemini-2.5-pro:streamGenerateContent
+function buildPayload(modelName, body, isStream) {
+    const { contents, generationConfig, systemInstruction, safetySettings, tools } = body;
+
+    return {
+        model: modelName,
+        request: {
+            contents: contents ?? [],
+            generationConfig: generationConfig ?? {},
+            safetySettings: safetySettings ?? [
+                { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_HATE_SPEECH",       threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+            ],
+            ...(tools            && { tools }),
+            ...(systemInstruction && { systemInstruction })
+        },
+        stream: isStream
+    };
+}
+
+// Kirim ke Gemmy tanpa streaming, kembalikan data mentah
+async function callGemmy(payload, token) {
+    const { data } = await axios.post(GEMMY_URL, payload, {
+        headers: { ...GEMMY_HEADERS, authorization: `Bearer ${token}` }
+    });
+    return data;
+}
+
+// Kirim ke Gemmy dengan streaming, kembalikan axios stream response
+async function callGemmyStream(payload, token) {
+    return axios.post(GEMMY_URL, payload, {
+        headers: { ...GEMMY_HEADERS, authorization: `Bearer ${token}` },
+        responseType: "stream"
+    });
+}
+
+// POST /v1beta/models/gemini-xxx:generateContent
+// POST /v1beta/models/gemini-xxx:streamGenerateContent
 app.post("/v1beta/models/:modelAndAction", async (req, res) => {
     try {
-        // Extract nama model dari path, buang action-nya
-        // "gemini-2.5-pro:generateContent" → "gemini-2.5-pro"
-        const [modelName] = req.params.modelAndAction.split(":");
-        const isStream = req.params.modelAndAction.endsWith(":streamGenerateContent");
+        const rawParam   = req.params.modelAndAction;
+        const isStream   = rawParam.endsWith(":streamGenerateContent");
+        const modelName  = rawParam.split(":")[0];
 
-        const {
-            contents,
-            generationConfig,
-            systemInstruction,
-            safetySettings,
-            tools
-        } = req.body;
+        const token   = await getToken();
+        const payload = buildPayload(modelName, req.body, isStream);
 
-        const token = await getToken();
+        if (!isStream) {
+            // ── Non-streaming: langsung forward response ──────────────────
+            const data = await callGemmy(payload, token);
+            return res.json(data);
+        }
 
-        const payload = {
-            model: modelName || CONFIG.DEFAULT_MODEL,
-            request: {
-                contents: contents ?? [],
-                generationConfig: generationConfig ?? {
-                    thinkingConfig: { thinkingLevel: "HIGH" }
-                },
-                safetySettings: safetySettings ?? [
-                    { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_NONE" },
-                    { category: "HARM_CATEGORY_HATE_SPEECH",       threshold: "BLOCK_NONE" },
-                    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-                    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-                ],
-                tools: tools ?? [{ googleSearch: {}, urlContext: {} }],
-                ...(systemInstruction && { systemInstruction })
-            },
-            stream: false  // Gemmy tidak support streaming, selalu false
-        };
+        // ── Streaming: reconstruct SSE yang 100% kompatibel Gemini CLI ───
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
 
-        const { data } = await axios.post(CONFIG.GEMMY_URL, payload, {
-            headers: {
-                ...CONFIG.HEADERS,
-                authorization: `Bearer ${token}`
+        const streamRes = await callGemmyStream(payload, token);
+
+        let buffer = "";
+
+        streamRes.data.on("data", (chunk) => {
+            buffer += chunk.toString("utf8");
+
+            // Gemini SSE format: "data: {...}\r\n\r\n" atau "data: {...}\n\n"
+            // Kita split per blok SSE
+            const blocks = buffer.split(/\r?\n\r?\n/);
+            buffer = blocks.pop() ?? ""; // simpan potongan terakhir yang belum lengkap
+
+            for (const block of blocks) {
+                const line = block.trim();
+                if (!line) continue;
+
+                if (line === "data: [DONE]") {
+                    res.write("data: [DONE]\n\n");
+                    continue;
+                }
+
+                // Ambil JSON dari "data: {...}"
+                const jsonStr = line.startsWith("data: ") ? line.slice(6) : line;
+
+                try {
+                    const parsed = JSON.parse(jsonStr);
+                    // Re-emit sebagai SSE chunk standar Gemini
+                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                } catch {
+                    // Kalau bukan JSON valid (misal komentar SSE), skip
+                    console.warn("[SKIP non-JSON chunk]", line.slice(0, 80));
+                }
             }
         });
 
-        if (isStream) {
-            // Gemini CLI kadang request stream, tapi kita fake SSE-nya
-            // dengan kirim satu chunk sekaligus lalu done
-            res.setHeader("Content-Type", "text/event-stream");
-            res.setHeader("Cache-Control", "no-cache");
-            res.setHeader("Connection", "keep-alive");
-
-            res.write(`data: ${JSON.stringify(data)}\r\n\r\n`);
-            res.write("data: [DONE]\r\n\r\n");
+        streamRes.data.on("end", () => {
+            // Proses sisa buffer kalau ada
+            if (buffer.trim()) {
+                const jsonStr = buffer.trim().startsWith("data: ")
+                    ? buffer.trim().slice(6)
+                    : buffer.trim();
+                try {
+                    const parsed = JSON.parse(jsonStr);
+                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                } catch { /* skip */ }
+            }
             res.end();
-        } else {
-            res.json(data);
-        }
+        });
+
+        streamRes.data.on("error", (err) => {
+            console.error("[STREAM ERROR]", err.message);
+            res.end();
+        });
+
     } catch (err) {
-        const status = err.response?.status ?? 500;
-        const message = err.response?.data ?? { error: { message: err.message } };
-        console.error(`[ERROR] ${status}:`, message);
-        res.status(status).json(message);
+        const status  = err.response?.status ?? 500;
+        const message = err.response?.data   ?? { error: { message: err.message, status: "INTERNAL" } };
+        console.error(`[ERROR ${status}]`, err.message);
+        if (!res.headersSent) res.status(status).json(message);
+        else res.end();
     }
 });
 
-// Health check
-app.get("/", (req, res) => {
-    res.json({ status: "ok", message: "Gemmy proxy is running" });
-});
+app.get("/", (_, res) => res.json({ status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Gemmy proxy running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Gemmy proxy → http://localhost:${PORT}`));
